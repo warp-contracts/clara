@@ -198,7 +198,10 @@ contract ClaraMarketTest is Test {
             payload: "task payload",
             topic: "chat",
             childTokenId: expectedTokenId,
-            childIpId: expectedIpId
+            childIpId: expectedIpId,
+            tasksToAssign: 1,
+            tasksAssigned: 1,
+            maxRepeatedPerAgent: 0
         }));
 
         uint256 reward = 100 ether;

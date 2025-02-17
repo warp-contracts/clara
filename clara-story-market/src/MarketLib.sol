@@ -33,6 +33,9 @@ library MarketLib {
         uint256 blockNumber;        // block.number// who created the task
         uint256 reward;             // reward for fulfilling the task
         uint256 childTokenId;
+        uint256 tasksToAssign;
+        uint256 tasksAssigned;
+        uint256 maxRepeatedPerAgent;
         address requester;
         address agentId;             // the assigned agent 
         address childIpId;
