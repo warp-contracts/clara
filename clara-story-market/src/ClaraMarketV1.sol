@@ -1,29 +1,30 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
+import "./QueueLib.sol";
 import "./mocks/AgentNFT.sol";
-import "./mocks/RevenueToken.sol";
 
-import { IPAssetRegistry } from "@storyprotocol/core/registries/IPAssetRegistry.sol";
-import { IRoyaltyWorkflows } from "@storyprotocol/periphery/interfaces/workflows/IRoyaltyWorkflows.sol";
+import "./mocks/RevenueToken.sol";
+import { ERC721Holder } from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import { ILicensingModule } from "@storyprotocol/core/interfaces/modules/licensing/ILicensingModule.sol";
-import { PILFlavors } from "@storyprotocol/core/lib/PILFlavors.sol";
-import { PILTerms } from "@storyprotocol/core/interfaces/modules/licensing/IPILicenseTemplate.sol";
+import { IPAssetRegistry } from "@storyprotocol/core/registries/IPAssetRegistry.sol";
 import { IPILicenseTemplate } from "@storyprotocol/core/interfaces/modules/licensing/IPILicenseTemplate.sol";
 import { IRoyaltyModule } from "@storyprotocol/core/interfaces/modules/royalty/IRoyaltyModule.sol";
-import { RoyaltyPolicyLAP } from "@storyprotocol/core/modules/royalty/policies/LAP/RoyaltyPolicyLAP.sol";
+import { IRoyaltyWorkflows } from "@storyprotocol/periphery/interfaces/workflows/IRoyaltyWorkflows.sol";
 
+import { PILFlavors } from "@storyprotocol/core/lib/PILFlavors.sol";
+import { PILTerms } from "@storyprotocol/core/interfaces/modules/licensing/IPILicenseTemplate.sol";
+// import {console} from "forge-std/console.sol";
+import { RoyaltyPolicyLAP } from "@storyprotocol/core/modules/royalty/policies/LAP/RoyaltyPolicyLAP.sol";
 import {Context} from "@openzeppelin/contracts/utils/Context.sol";
 import {MarketLib} from "./MarketLib.sol";
-// import {console} from "forge-std/console.sol";
-import { ERC721Holder } from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 
 error UnknownTopic(bytes32 topic);
 error UnknownMatchingStrategy(bytes32 strategy);
 error AgentNotRegistered(address agent);
 error AgentAlreadyRegistered(address agent);
 error TaskNotFound(uint256 taskId);
-error FeeNegative();
+error ValueNegative();
 error NoAgentsMatchedForTask();
 
 /**
@@ -34,6 +35,7 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     bytes32 internal constant STRATEGY_BROADCAST = "broadcast";
     bytes32 internal constant STRATEGY_LEAST_OCCUPIED = "leastOccupied";
     bytes32 internal constant STRATEGY_CHEAPEST = "cheapest";
+    bytes32 internal constant STRATEGY_MULTITASK = "multiTask";
 
     bytes32 internal constant TOPIC_TWEET = "tweet";
     bytes32 internal constant TOPIC_DISCORD = "discord";
@@ -41,6 +43,8 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     bytes32 internal constant TOPIC_NFT = "nft";
     bytes32 internal constant TOPIC_CHAT = "chat";
     bytes32 internal constant TOPIC_NONE = "none";
+    
+    address internal constant ZERO_ADDRESS = address(0);
 
     // viem.keccak256(toHex("RedStone.ClaraMarket.Storage"))
     bytes32 private constant STORAGE_LOCATION = 0x662d955f31e0cda1ca2e8148a249b0c86a4293138bfb4d882e692ec1f9dabd24;
@@ -51,7 +55,10 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     address[] public allAgents;
     uint256 public agentsLength;
     mapping(address => MarketLib.AgentTotals) public agentTotals;
+    mapping(address => mapping(uint256 => uint256)) public multiTasksPerformed;
     mapping(address => mapping(uint256 => MarketLib.Task)) public agentInbox;
+    using QueueLib for QueueLib.Queue;
+    QueueLib.Queue public tasksQueue;
 
     IPAssetRegistry public immutable IP_ASSET_REGISTRY;
     ILicensingModule public immutable LICENSING_MODULE;
@@ -59,6 +66,9 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     RoyaltyPolicyLAP public immutable ROYALTY_POLICY_LAP;
     IRoyaltyWorkflows public immutable ROYALTY_WORKFLOWS;
     IRoyaltyModule public immutable ROYALTY_MODULE;
+    
+    uint256 public tasksCounter;
+    uint256 public multiTaskCounter;
 
     RevenueToken public immutable REVENUE_TOKEN;
     AgentNFT public immutable AGENT_NFT;
@@ -67,8 +77,6 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     mapping(bytes32 => bool) internal topics;
     mapping(bytes32 => bool) internal matchingStrategies;
 
-    // private
-    uint256 public tasksCounter;
 
     // events
     event RegisteredAgent(address indexed agent, MarketLib.AgentInfo agentInfo);
@@ -105,6 +113,7 @@ contract ClaraMarketV1 is Context, ERC721Holder {
         matchingStrategies[STRATEGY_CHEAPEST] = true;
 
         tasksCounter = 1;
+        multiTaskCounter = 1;
 
         AGENT_NFT = new AgentNFT("CLARA AGENT IP NFT", "CAIN"); // not sure if CAIN is the best symbol :)
     }
@@ -122,7 +131,7 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     {
         require(agents[_msgSender()].exists == false, AgentAlreadyRegistered(_msgSender()));
         _assertTopic(_topic);
-        require(_fee >= 0, FeeNegative());
+        require(_fee >= 0, ValueNegative());
 
         uint256 tokenId = AGENT_NFT.mint(address(this));
         address ipId = IP_ASSET_REGISTRY.register(block.chainid, address(AGENT_NFT), tokenId);
@@ -152,6 +161,7 @@ contract ClaraMarketV1 is Context, ERC721Holder {
             licenceTermsId: licenseTermsId
 
         });
+        _dispatchTasksInternal();
         emit RegisteredAgent(_msgSender(), agents[_msgSender()]);
     }
 
@@ -159,10 +169,10 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     external
     {
         require(agents[_msgSender()].exists == true, AgentNotRegistered(_msgSender()));
-        require(_fee >= 0, FeeNegative());
+        require(_fee >= 0, ValueNegative());
 
         agents[_msgSender()].fee = _fee;
-    
+        _dispatchTasksInternal();
         emit UpdatedAgent(_msgSender(), agents[_msgSender()]);
     }
 
@@ -176,7 +186,7 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     external
     {
         _assertAgentRegistered();
-        require(_reward >= 0, FeeNegative());
+        require(_reward >= 0, ValueNegative());
         _assertTopic(_topic);
         _assertMatchingStrategy(_matchingStrategy);
 
@@ -189,17 +199,60 @@ contract ClaraMarketV1 is Context, ERC721Holder {
             blockNumber: block.number,
             reward: _reward,
             requester: _msgSender(),
-            agentId: address(0),
+            agentId: ZERO_ADDRESS,
             matchingStrategy: _matchingStrategy,
             payload: _payload,
             topic: _topic,
             childTokenId: 0,
-            childIpId: address(0)
+            childIpId: ZERO_ADDRESS,
+            tasksToAssign: 1,
+            tasksAssigned: 1,
+            maxRepeatedPerAgent: 0
         });
 
         // locking Revenue Tokens on Market contract - allowance required!
         REVENUE_TOKEN.transferFrom(_msgSender(), address(this), _reward);
-        _dispatchTasksInternal(newTask);
+        tasksQueue.push(newTask);
+        _dispatchTasksInternal();
+    }
+
+    function registerMultiTask(
+        uint256 _tasksCount,
+        uint256 _maxRewardPerTask,
+        uint256 _maxRepeatedTasksPerAgent,
+        bytes32 _topic,
+        string calldata _payload
+    )
+    external
+    {
+        _assertAgentRegistered();
+        require(_maxRewardPerTask >= 0, ValueNegative());
+        _assertTopic(_topic);
+
+        agentTotals[_msgSender()].requested += 1;
+
+        MarketLib.Task memory newTask = MarketLib.Task({
+            id: multiTaskCounter++,
+            contextId: 0,
+            timestamp: block.timestamp,
+            blockNumber: block.number,
+            reward: _maxRewardPerTask,
+            requester: _msgSender(),
+            agentId: ZERO_ADDRESS,
+            matchingStrategy: STRATEGY_MULTITASK,
+            payload: _payload,
+            topic: _topic,
+            childTokenId: 0,
+            childIpId: ZERO_ADDRESS,
+            tasksToAssign: _tasksCount,
+            tasksAssigned: 0,
+            maxRepeatedPerAgent: _maxRepeatedTasksPerAgent
+        });
+
+        // locking Revenue Tokens on Market contract - allowance required!
+        tasksQueue.push(newTask);
+        REVENUE_TOKEN.transferFrom(_msgSender(), address(this), _tasksCount * _maxRewardPerTask);
+        _dispatchTasksInternal();
     }
 
     function sendResult(
@@ -231,9 +284,6 @@ contract ClaraMarketV1 is Context, ERC721Holder {
             result: _resultJSON
         });
 
-        // agentResults[originalTask.requester][originalTask.id] = taskResult;
-        // Transfer tokens from contract balance to the agent
-        //_transferTokens(_msgSender(), originalTask.reward);
         REVENUE_TOKEN.approve(address(ROYALTY_MODULE), originalTask.reward);
         ROYALTY_MODULE.payRoyaltyOnBehalf(originalTask.childIpId, address(this), address(REVENUE_TOKEN), originalTask.reward);
 
@@ -254,39 +304,92 @@ contract ClaraMarketV1 is Context, ERC721Holder {
         emit TaskResultSent(originalTask.requester, _msgSender(), originalTask.id, taskResult);
     }
 
-    function _dispatchTasksInternal(MarketLib.Task memory _task) internal {
-        if (_task.matchingStrategy == STRATEGY_BROADCAST) {
-            // broadcast strategy => assign to all matching agents
-            // console.log("broadcast");
-            address[] memory matchedAgents = _matchBroadcast(
-                _task.reward,
-                _task.requester,
-                _task.topic
-            );
-            // console.log(matchedAgents.length);
-            require(matchedAgents.length > 0, NoAgentsMatchedForTask());
-            uint256 rewardLeft = _task.reward;
+    function _dispatchTasksInternal() internal {
+        uint256 tasksQueueLength = tasksQueue.length();
+        if (tasksQueueLength == 0) {
+            return;
+        }
+
+        MarketLib.Task[] memory notMatchedTasks = new MarketLib.Task[](tasksQueueLength);
+        uint256 notMatchedTasksCount = 0;
         
-            for (uint256 k = 0; k < matchedAgents.length; k++) {
-                address agentId = matchedAgents[k];
-                uint256 agentFee = agents[agentId].fee;
-                if (rewardLeft >= agentFee) {
-                    _storeAndSendTask(agentId, _task, agentFee);
-                    rewardLeft -= agentFee;
+        for (uint256 idx = 0; idx < tasksQueueLength; idx++) {
+            if (tasksQueue.isEmpty()) {
+                // this should not happen, but better safe than sorry...
+                return;
+            }
+            MarketLib.Task memory _task = tasksQueue.pop();
+
+            if (_task.matchingStrategy == STRATEGY_BROADCAST) {
+                // broadcast strategy => assign to all matching agents
+                address[] memory matchedAgents = _filterAgentsWithTopicAndFee(
+                    _task.reward,
+                    _task.requester,
+                    _task.topic
+                );
+                if (matchedAgents.length == 0) {
+                    notMatchedTasks[notMatchedTasksCount++] = _task;
                 } else {
-                    return;
+                    uint256 rewardLeft = _task.reward;
+                
+                    for (uint256 k = 0; k < matchedAgents.length; k++) {
+                        address agentId = matchedAgents[k];
+                        uint256 agentFee = agents[agentId].fee;
+                        if (rewardLeft >= agentFee) {
+                            _storeAndSendTask(agentId, _task, agentFee);
+                            rewardLeft -= agentFee;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            } else if (_task.matchingStrategy == STRATEGY_LEAST_OCCUPIED) {
+                address chosen = _matchLeastOccupied(_task.reward, _task.requester, _task.topic);
+                if (chosen != ZERO_ADDRESS) {
+                    uint256 agentFee = agents[chosen].fee;
+                    _storeAndSendTask(chosen, _task, agentFee);
+                } else {
+                    notMatchedTasks[notMatchedTasksCount++] = _task;
+                }
+            } else if (_task.matchingStrategy == STRATEGY_CHEAPEST) {
+                address chosen = _matchCheapest(_task.reward, _task.requester, _task.topic);
+                if (chosen != ZERO_ADDRESS) {
+                    uint256 agentFee = agents[chosen].fee;
+                    _storeAndSendTask(chosen, _task, agentFee);
+                } else {
+                    notMatchedTasks[notMatchedTasksCount++] = _task;
+                }
+            } else if (_task.matchingStrategy == STRATEGY_MULTITASK) {
+                address[] memory matchedAgents = _filterAgentsWithTopicAndFee(
+                    _task.reward,
+                    _task.requester,
+                    _task.topic
+                );
+                for (uint256 k = 0; k < matchedAgents.length; k++) {
+                    address agentId = matchedAgents[k];
+                    uint256 agentFee = agents[agentId].fee;
+                    if (multiTasksPerformed[agentId][_task.id] < _task.maxRepeatedPerAgent) {
+                        _task.tasksAssigned += 1;
+                        multiTasksPerformed[agentId][_task.id] += 1;
+                        _storeAndSendTask(agentId, _task, agentFee);
+                        if (_task.tasksAssigned == _task.tasksToAssign) {
+                            break;
+                        }
+                    }
+                }
+                
+                // force the task to be put again in the queue
+                if (_task.tasksAssigned < _task.tasksToAssign) {
+                    notMatchedTasks[notMatchedTasksCount++] = _task;
                 }
             }
-        } else if (_task.matchingStrategy == STRATEGY_LEAST_OCCUPIED) {
-            address chosen = _matchLeastOccupied(_task.reward, _task.requester, _task.topic);
-            require(chosen != address(0), NoAgentsMatchedForTask());
-            uint256 agentFee = agents[chosen].fee;
-            _storeAndSendTask(chosen, _task, agentFee);
-        } else if (_task.matchingStrategy == STRATEGY_CHEAPEST) {
-            address cheapest = _matchCheapest(_task.reward, _task.requester, _task.topic);
-            require(cheapest != address(0), NoAgentsMatchedForTask());
-            uint256 agentFee = agents[cheapest].fee;
-            _storeAndSendTask(cheapest, _task, agentFee);
+        }
+        
+        // push the tasks that were not assigned back on queue
+        if (notMatchedTasksCount > 0) {
+            for (uint256 idx = 0; idx < notMatchedTasksCount; idx++) {
+                tasksQueue.push(notMatchedTasks[idx]);
+            }
         }
     }
 
@@ -295,11 +398,12 @@ contract ClaraMarketV1 is Context, ERC721Holder {
         MarketLib.Task memory originalTask,
         uint256 agentFee
     ) internal {
-        // console.log("_storeAndSendTask");
         originalTask.reward = agentFee;
         originalTask.agentId = _agentId;
 
         uint256 taskId = tasksCounter++;
+        
+        // TODO: optimize
         MarketLib.Task memory finalTask = MarketLib.Task({
             id: taskId,
             contextId: originalTask.contextId == 0 ? taskId : originalTask.contextId,
@@ -312,32 +416,26 @@ contract ClaraMarketV1 is Context, ERC721Holder {
             payload: originalTask.payload,
             topic: originalTask.topic,
             childTokenId: 0,
-            childIpId: address(0)
+            childIpId: ZERO_ADDRESS,
+            tasksToAssign: originalTask.tasksToAssign,
+            tasksAssigned: originalTask.tasksAssigned,
+            maxRepeatedPerAgent: originalTask.maxRepeatedPerAgent
         });
 
         uint256 childTokenId = AGENT_NFT.mint(address(this));
         address childIpId = IP_ASSET_REGISTRY.register(block.chainid, address(AGENT_NFT), childTokenId);
 
         // mint a license token from the parent
-        /*console.log("mintLicenseTokens");
-        console.log(address(this));
-        console.log("ipAssetId", agents[_agentId].ipAssetId);
-        console.log("pilTemplate", address(PIL_TEMPLATE));
-        console.log("licenceTermsId", agents[_agentId].licenceTermsId);*/
-        
         uint256 licenseTokenId = LICENSING_MODULE.mintLicenseTokens({
             licensorIpId: agents[_agentId].ipAssetId,
             licenseTemplate: address(PIL_TEMPLATE),
             licenseTermsId: agents[_agentId].licenceTermsId,
             amount: 1,
-        // mint the license token to this contract so it can
-        // use it to register as a derivative of the parent
             receiver: address(this),
             royaltyContext: "", // for PIL, royaltyContext is empty string
             maxMintingFee: 0,
             maxRevenueShare: 0
         });
-        // console.log("after mintLicenseTokens");
 
         uint256[] memory licenseTokenIds = new uint256[](1);
         licenseTokenIds[0] = licenseTokenId;
@@ -353,14 +451,11 @@ contract ClaraMarketV1 is Context, ERC721Holder {
         finalTask.childIpId = childIpId;
         finalTask.childTokenId = childTokenId;
 
-        // transfer the NFT to the receiver so it owns the child IPA
-        // console.log("Before transfer");
-        // console.log(_agentId);
-        AGENT_NFT.transferFrom(address(this), _agentId, childTokenId);
-        // console.log("after transfer");
-        
         agentInbox[_agentId][finalTask.id] = finalTask;
         agentTotals[_agentId].assigned += 1;
+
+        // transfer the NFT to the receiver so it owns the child IPA
+        AGENT_NFT.transferFrom(address(this), _agentId, childTokenId);
 
         emit TaskAssigned(finalTask.requester, _agentId, finalTask.id, finalTask);
     }
@@ -412,14 +507,6 @@ contract ClaraMarketV1 is Context, ERC721Holder {
         return filtered;
     }
 
-    function _matchBroadcast(
-        uint256 _reward,
-        address _requesterId,
-        bytes32 _topic
-    ) internal view returns (address[] memory) {
-        return _filterAgentsWithTopicAndFee(_reward, _requesterId, _topic);
-    }
-
     function _matchLeastOccupied(
         uint256 _reward,
         address _requesterId,
@@ -427,11 +514,11 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     ) internal view returns (address) {
         address[] memory candidates = _filterAgentsWithTopicAndFee(_reward, _requesterId, _topic);
         if (candidates.length == 0) {
-            return address(0);
+            return ZERO_ADDRESS;
         }
 
         uint256 minCount = type(uint256).max;
-        address chosen = address(0);
+        address chosen = ZERO_ADDRESS;
 
         for (uint256 i = 0; i < candidates.length; i++) {
             uint256 inboxCount = _agentInboxCount(candidates[i]);
@@ -450,12 +537,12 @@ contract ClaraMarketV1 is Context, ERC721Holder {
     ) internal view returns (address) {
         address[] memory candidates = _filterAgentsWithTopicAndFee(_reward, _requesterId, _topic);
         if (candidates.length == 0) {
-            return address(0);
+            return ZERO_ADDRESS;
         }
 
         uint256 minFee = type(uint256).max;
         uint256 minAssigned = type(uint256).max;
-        address chosen = address(0);
+        address chosen = ZERO_ADDRESS;
 
         for (uint256 i = 0; i < candidates.length; i++) {
             uint256 fee_ = agents[candidates[i]].fee;
